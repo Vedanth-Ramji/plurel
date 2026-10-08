@@ -202,6 +202,15 @@ def test_mlp_edge_places_activations_between_layers(latents):
         MLPEdge("h", (w1,), activations=("tanh",))
 
 
+def test_edge_can_transform_concatenated_parents(latents):
+    weights = (np.array([[1.0], [2.0]]),)
+    edge = MLPEdge(("x", "y"), weights)
+    node = Node((edge,), noise=None)
+    expected = latents["x"] + 2.0 * latents["y"]
+    assert node.parents == ("x", "y")
+    np.testing.assert_allclose(node.evaluate(latents, np.zeros((N, 1))), expected)
+
+
 def test_tree_edge_averages_oblivious_tree_leaves(latents):
     h = latents["h"]
     expected = np.zeros((N, 2))

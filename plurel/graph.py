@@ -83,10 +83,31 @@ def _draw(distribution: Distribution, n: int, rng: np.random.Generator, dim: int
 
 @dataclass(frozen=True)
 class Edge:
-    """One parent's contribution to a node; the tail is a node name or a crossing reference."""
+    """One contribution to a node; the tail is one parent, several local parents, or a
+    crossing reference."""
 
     parent: Hashable
     dim = 1
+
+    @property
+    def sources(self) -> tuple[Hashable, ...]:
+        # Normalize one parent and a tuple of joint parents to the same interface.
+        # e.g. "age" becomes ("age",) and ("age", "income") remains unchanged.
+        return self.parent if isinstance(self.parent, tuple) else (self.parent,)
+
+    def read_latents(self, latents: Mapping[Hashable, np.ndarray]) -> np.ndarray:
+        """Return this edge's input from its parents' latent values.
+
+        Each parent array has shape ``(rows, dimensions)``. One parent is returned unchanged;
+        multiple parents are concatenated across dimensions while preserving row alignment.
+
+        This ability to concatenate parents' latent representations allows for more native
+        combined processing of several parents.
+        """
+        parent_values = [latents[source] for source in self.sources]
+        return (
+            parent_values[0] if len(parent_values) == 1 else np.concatenate(parent_values, axis=1)
+        )
 
     def apply(self, x: np.ndarray) -> np.ndarray:
         raise NotImplementedError
@@ -276,7 +297,10 @@ class Node:
 
     @property
     def parents(self) -> tuple[Hashable, ...]:
-        return tuple(dict.fromkeys(edge.parent for edge in (*self.edges, *self.scale)))
+        # A joint edge still contributes each source separately to the causal dependencies.
+        return tuple(
+            dict.fromkeys(source for edge in (*self.edges, *self.scale) for source in edge.sources)
+        )
 
     def sample_noise(self, n: int, rng: np.random.Generator) -> np.ndarray:
         return _draw(self.noise, n, rng, self.dim) if self.noise else np.zeros((n, self.dim))
@@ -289,14 +313,16 @@ class Node:
     ) -> np.ndarray:
         """The value from the parents' latents, the exogenous term (scaled by the `scale` edges)
         and, if given, the summed contributions of the crossing edges."""
-        terms = [edge.apply(latents[edge.parent]) for edge in self.edges]
+        terms = [edge.apply(edge.read_latents(latents)) for edge in self.edges]
         signal = REDUCTIONS[self.op](terms) if terms else np.zeros_like(exogenous)
         if across is not None:
             signal = signal + across
         if self.standardize:
             signal = standardize(signal)
         if self.scale:
-            log_scale = reduce(np.add, [edge.apply(latents[edge.parent]) for edge in self.scale])
+            log_scale = reduce(
+                np.add, [edge.apply(edge.read_latents(latents)) for edge in self.scale]
+            )
             exogenous = exogenous * np.exp(np.clip(log_scale, -LOG_SCALE_CLIP, LOG_SCALE_CLIP))
         value = signal + exogenous
         if self.bias is not None:

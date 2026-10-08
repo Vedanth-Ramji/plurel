@@ -16,8 +16,9 @@ from plurel.distributions import (
     TimeSeries,
     Uniform,
 )
-from plurel.graph import EDGES, REDUCTIONS, Foreign, LookupEdge, NearestEdge, Summary
+from plurel.graph import EDGES, REDUCTIONS, Foreign, LookupEdge, NearestEdge, QuadraticEdge, Summary
 from plurel.io import create_database
+from plurel.layouts import ErdosRenyi
 from plurel.links import TreeLink
 from plurel.prior import (
     FAMILIES,
@@ -156,6 +157,31 @@ def test_table_prior_knobs_are_respected():
     scm = single.realize(0)
     assert len(scm.nodes) <= 2 and not scm.nodes["n0"].parents
     assert sample(scm, 5, seed=0).shape[0] == 5
+
+
+def test_table_prior_can_force_joint_multi_parent_mechanisms():
+    fixed = dict(
+        node_count=IntegersRange(4, 4),
+        node_layouts=Choices((ErdosRenyi(1.0),)),
+        node_categorical_share=Range(0.0, 0.0),
+        joint_mechanism_families=Choices(("quadratic",)),
+    )
+    joint = TablePrior(**fixed, joint_mechanism_share=Range(1.0, 1.0)).realize(0)
+    joint_nodes = {
+        name: node
+        for name, node in joint.nodes.items()
+        if node.edges and isinstance(node.edges[0].parent, tuple)
+    }
+    assert set(joint_nodes) == {"n2", "n3"}
+    for node in joint_nodes.values():
+        assert len(node.edges) == 1 and isinstance(node.edges[0], QuadraticEdge)
+        assert node.parents == node.edges[0].parent
+    sample(joint, 50, seed=0)
+
+    separate = TablePrior(**fixed, joint_mechanism_share=Range(0.0, 0.0)).realize(0)
+    assert not any(
+        isinstance(edge.parent, tuple) for node in separate.nodes.values() for edge in node.edges
+    )
 
 
 def test_structured_missingness_follows_its_indicator_node():

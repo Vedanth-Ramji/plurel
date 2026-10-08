@@ -69,25 +69,25 @@ ZERO_INFLATED = tuple(
 OUTLIERS = Mixture((Normal(), Normal(0.0, 8.0)), (0.97, 0.03))
 
 
-def _linear(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
+def _linear(prior, parent: Hashable, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
     return LinearEdge(parent, float(rng.normal()), str(rng.choice(TRANSFORM_NAMES)), dim=d_in)
 
 
-def _lookup(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
+def _lookup(prior, parent: Hashable, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
     k = prior.node_class_count.draw(rng)
     probabilities = tuple(float(p) for p in rng.dirichlet(np.ones(k)))
     return LookupEdge(parent, tuple(float(v) for v in rng.normal(size=k)), probabilities)
 
 
-def _matrix(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
+def _matrix(prior, parent: Hashable, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
     return MatrixEdge(parent, rng.normal(0.0, 1.0 / np.sqrt(d_in), (d_in, d_out)))
 
 
-def _nearest(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
+def _nearest(prior, parent: Hashable, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
     return NearestEdge(parent, rng.normal(size=(d_out, d_in)))
 
 
-def _mlp(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
+def _mlp(prior, parent: Hashable, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
     hidden = [prior.mlp_hidden_width.draw(rng) for _ in range(prior.mlp_layer_count.draw(rng))]
     widths, gain = [d_in, *hidden, d_out], prior.mlp_weight_scale.draw(rng)
     weights = tuple(rng.normal(0.0, gain / np.sqrt(a), (a, b)) for a, b in zip(widths, widths[1:]))
@@ -96,7 +96,7 @@ def _mlp(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator) ->
     return MLPEdge(parent, weights, biases, activations)
 
 
-def _tree(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
+def _tree(prior, parent: Hashable, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
     trees, depth = prior.tree_count.draw(rng), prior.tree_depth.draw(rng)
     splits = rng.integers(0, d_in, (trees, depth))
     return TreeEdge(
@@ -104,7 +104,7 @@ def _tree(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator) -
     )
 
 
-def _fourier(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
+def _fourier(prior, parent: Hashable, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
     frequencies = rng.normal(size=(d_in, prior.fourier_frequency_count)) * rng.uniform(0.5, 3.0)
     phases = rng.uniform(0.0, 2.0 * np.pi, prior.fourier_frequency_count)
     weights = rng.normal(
@@ -113,7 +113,7 @@ def _fourier(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator
     return FourierEdge(parent, frequencies, phases, weights)
 
 
-def _quadratic(prior, parent: str, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
+def _quadratic(prior, parent: Hashable, d_in: int, d_out: int, rng: np.random.Generator) -> Edge:
     scale = 1.0 / (np.sqrt(d_in) * (d_in + 1))
     return QuadraticEdge(parent, rng.normal(0.0, scale, (d_out, d_in + 1, d_in + 1)))
 
@@ -243,6 +243,9 @@ class TablePrior:
         node_categorical_share: Share of the nodes that are categorical, one-hot nodes.
         node_class_count: Classes of a categorical node, and levels of a lookup edge.
         node_ops: Reduction over the edges of a numeric node with several parents.
+        joint_mechanism_share: Share of multi-parent numeric nodes whose parent blocks are
+            concatenated and transformed by one edge.
+        joint_mechanism_families: Edge families used for joint multi-parent mechanisms.
         node_noise_shapes: Unit-scale shape of a numeric node's noise: normal, heavier-tailed
             (Laplace, Student-t) or skewed (a centred gamma); ``node_noise_std`` scales it.
         node_noise_std: Standard deviation of the noise of a numeric node, relative
@@ -303,6 +306,8 @@ class TablePrior:
         ("sum", "product", "max", "min", "logsumexp", "concat", "compound"),
         (6.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0),
     )
+    joint_mechanism_share: Range = Range(0.0, 0.6)
+    joint_mechanism_families: Choices = Choices(("mlp", "tree", "fourier", "quadratic"))
     node_noise_std: Range = LogRange(0.001, 0.5)
     node_noise_shapes: Choices = Choices(
         (Normal(), Laplace(scale=0.7), StudentT(4.0, 0.7), Affine(Gamma(2.0), -2.0, 0.7)),
@@ -369,8 +374,14 @@ class TablePrior:
     time_calendars: Choices = Choices(CALENDARS)
 
     def __post_init__(self) -> None:
-        if set(self.edge_families.values) <= set(FITS):
-            raise ValueError("edge_families needs a family that fits any widths")
+        for name, families in (
+            ("edge_families", self.edge_families),
+            ("joint_mechanism_families", self.joint_mechanism_families),
+        ):
+            if unknown := set(families.values) - set(BUILDERS):
+                raise ValueError(f"{name} has unknown families {sorted(unknown)}")
+            if set(families.values) <= set(FITS):
+                raise ValueError(f"{name} needs a family that fits any widths")
 
     def warp(self, rng: np.random.Generator) -> "TablePrior":
         return _warped(self, rng)
@@ -383,8 +394,16 @@ class TablePrior:
         n = self.node_count.draw(rng)
         parents = self.node_layouts.draw(rng).sample(n, rng)
         categorical = rng.random(n) < self.node_categorical_share.draw(rng)
+        joint = [
+            len(parents[i]) > 1
+            and not categorical[i]
+            and rng.random() < self.joint_mechanism_share.draw(rng)
+            for i in range(n)
+        ]
         ops = [
-            self.node_ops.draw(rng) if len(parents[i]) > 1 and not categorical[i] else "sum"
+            self.node_ops.draw(rng)
+            if len(parents[i]) > 1 and not categorical[i] and not joint[i]
+            else "sum"
             for i in range(n)
         ]
         dims: list[int] = []
@@ -396,7 +415,7 @@ class TablePrior:
             else:
                 dims.append(self.node_width.draw(rng))
         nodes = {
-            f"n{i}": self.node(parents[i], ops[i], dims, i, categorical, rng, time)
+            f"n{i}": self.node(parents[i], ops[i], dims, i, categorical, joint[i], rng, time)
             for i in range(n)
         }
         columns = {"id": Column(kind="key")}
@@ -422,6 +441,7 @@ class TablePrior:
         dims: list[int],
         i: int,
         categorical: np.ndarray,
+        joint: bool,
         rng: np.random.Generator,
         time: bool,
     ) -> Node:
@@ -433,9 +453,14 @@ class TablePrior:
             series = time and rng.random() < self.root_series_share.draw(rng)
             noise = self.series(rng) if series else self.root_noise.draw(rng)
             return Node(dim=dims[i], noise=noise, standardize=True)
+        noise = Affine(self.node_noise_shapes.draw(rng), scale=self.node_noise_std.draw(rng))
+        if joint:
+            parents = tuple(f"n{p}" for p in sources)
+            family = self.joint_mechanism_families.draw(rng)
+            edge = BUILDERS[family](self, parents, sum(dims[p] for p in sources), dims[i], rng)
+            return Node((edge,), noise=noise, standardize=True)
         widths = [dims[p] if op == "concat" else dims[i] for p in sources]
         edges = tuple(self.edge(f"n{p}", dims[p], w, False, rng) for p, w in zip(sources, widths))
-        noise = Affine(self.node_noise_shapes.draw(rng), scale=self.node_noise_std.draw(rng))
         return Node(edges, op, noise=noise, standardize=True)
 
     def edge(
